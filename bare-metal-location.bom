@@ -1,0 +1,26 @@
+brooklyn.catalog:
+  version: 0.0.1-SNAPSHOT
+  libraries:
+  - "https://artifactory.cloudsoftcorp.com/artifactory/libs-release-local/io/cloudsoft/jclouds/labs/softlayer-bmc/2.0.1/softlayer-bmc-2.0.1.jar"
+  items:
+  - id: softlayer-bmc-anywhere
+    itemType: location
+    item:
+      type: jclouds:softlayer-bmc
+      brooklyn.config:
+        displayName: SoftLayer BMC (any region)
+        identity: your-sl-identity
+        credential: your-sl-api-key
+        imageId: UBUNTU_16_64
+        # alternatively, imageId: CENTOS_7_64
+        # optionally
+        #templateOptions:
+        #  domainName: yourdomain.foo # default is jclouds.org
+  - id: bmc-sjc04-gpu1
+    itemType: location
+    item:
+      type: softlayer-bmc-anywhere
+      brooklyn.config:
+        region: sjc04
+        displayName: SoftLayer BMC @ SJC04 (D2620_128GB_2X1TB_SATA_RAID_1_M60_GPU1)
+        hardwareId: D2620_128GB_2X1TB_SATA_RAID_1_M60_GPU1
