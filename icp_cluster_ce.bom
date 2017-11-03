@@ -1,0 +1,200 @@
+brooklyn.catalog:
+  version: 0.0.1-SNAPSHOT
+  publish: 
+    description: IBM Cloud private CE deployment on bare metal
+  items: 
+  - id: icp-ce-worker-node
+    description: A cluster of Streams Domain Instance Nodes
+    itemType: entity
+    item: 
+      type: org.apache.brooklyn.entity.software.base.VanillaSoftwareProcess
+      name: IBM Cloud private CE worker node
+      id: icp-ce-worker-node
+      shell.env:
+        ENTITY_ID: $brooklyn:attributeWhenReady("entity.id")
+      files.install:
+        file:///~/cuda-repo-ubuntu1604-9-0-local_9.0.176-1_amd64-deb: "cuda-repo-ubuntu1604-9-0-local_9.0.176-1_amd64-deb"
+      install.command: |
+        # Only install if GPU present
+        if [ `lspci | grep NVIDIA | wc -l` -gt 0 ];
+        then 
+          # Install CUDA
+          sudo dpkg -i cuda-repo-ubuntu1604-*_amd64-deb
+          sudo apt-key add /var/cuda-repo-9-0-local/7fa2af80.pub
+          sudo apt-get update 
+          sudo apt-get install -y cuda
+          # Update bashrc with CUDA libs/binaries
+          echo "# CUDA Toolkit" | tee -a ~/.bashrc
+          echo "export CUDA_HOME=/usr/local/cuda" | tee -a ~/.bashrc
+          echo "export PATH=$PATH:${CUDA_HOME}/bin" | tee -a ~/.bashrc
+          echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${CUDA_HOME}/lib64:/usr/local/lib" | tee -a ~/.bashrc
+          sudo ln -s /usr/local/cuda/ /usr/local/nvidia
+        fi;
+      checkRunning.command: |
+        service docker status
+      launch.command: |
+        touch /tmp/running
+      provisioning.properties:
+        osFamily: Ubuntu
+        osVersionRegex: 16.*
+        domainName: icp.ibm.com
+        groupId: icp-ce-worker
+        minDisk: 100gb
+        templateOptions:
+          blockDevices: 
+            - 100
+  - id: icp-ce-worker-cluster-entity
+    description: A cluster of IBM Cloud private CE Worker Nodes
+    item: 
+      type: org.apache.brooklyn.entity.group.DynamicCluster
+      name: ICp CE Worker Node cluster
+      id: icp-ce-worker-node-cluster
+      brooklyn.config: 
+        initialSize: $brooklyn:config("icp.worker.cluster.initial.size")
+      brooklyn.enrichers:
+        - type: org.apache.brooklyn.enricher.stock.Aggregator
+          brooklyn.config:
+            uniqueTag: icp-ce-endpoint-aggregator
+            enricher.sourceSensor: $brooklyn:sensor("host.subnet.address")
+            enricher.targetSensor: $brooklyn:sensor("worker.endpoint.list")
+            enricher.aggregating.fromMembers: true
+        - type: org.apache.brooklyn.enricher.stock.Joiner
+          brooklyn.config:
+            uniqueTag: icp-ce-host-list
+            enricher.sourceSensor: $brooklyn:sensor("worker.endpoint.list")
+            enricher.targetSensor: $brooklyn:sensor("worker.address.list.commaSeperated")
+            separator: ","
+            quote: false
+            minimum: $brooklyn:config("icp.worker.cluster.initial.size")
+      memberSpec:
+        $brooklyn:entitySpec:
+          type: icp-ce-worker-node
+          name: IBM Cloud private Worker Node
+          brooklyn.enrichers: 
+            - type: org.apache.brooklyn.enricher.stock.Transformer
+              brooklyn.config:
+                enricher.sourceSensor: $brooklyn:sensor("service.isUp")
+                enricher.targetSensor: $brooklyn:sensor("worker.address")
+                enricher.targetValue: $brooklyn:attributeWhenReady("host.subnet.address")
+  - id: icp-ce-master-node
+    description: An IBM Cloud private Master Node
+    itemType: entity
+    item: 
+      type: org.apache.brooklyn.entity.software.base.VanillaSoftwareProcess
+      name: IBM Cloud private CE master node
+      id: icp-ce-master-node
+      install.latch: $brooklyn:component("icp-ce-worker-node-cluster").attributeWhenReady("service.isUp")
+      shell.env:
+        WORKER_ADDRESS_STRING: $brooklyn:component("icp-ce-worker-node-cluster").attributeWhenReady("worker.address.list.commaSeperated")
+        PRIVATE_IP: $brooklyn:attributeWhenReady("host.subnet.address")
+        ENTITY_ID: $brooklyn:attributeWhenReady("entity.id")
+      brooklyn.initializers:
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: public.key
+          #period: 1s
+          command: sudo cat /root/.ssh/id_rsa.pub
+      install.command: |
+        cd ~
+        # Pull the cluster install data
+        sudo mkdir /data
+        sudo mkdir -p /opt/ibm-cloud-private-1.2.0/
+        cd /opt/ibm-cloud-private-1.2.0/
+        sudo docker run -e LICENSE=accept --rm -v "$(pwd)":/data ibmcom/cfc-installer:1.2.0 cp -r cluster /data
+        cat <<EOF > /tmp/temp_hosts
+        [master]
+        ${PRIVATE_IP}
+        [worker]
+        `echo "${WORKER_ADDRESS_STRING}" | tr "," $'\n'`
+        [proxy]
+        ${PRIVATE_IP}
+        EOF
+        sudo cp /tmp/temp_hosts hosts
+        cat ~/root_id_rsa | sudo tee -a ssh_key
+        sudo cp ssh_key cluster/
+        sudo cp hosts cluster/
+        cd /opt/ibm-cloud-private-1.2.0/cluster
+        sudo docker run -e LICENSE=accept --net=host -t -v "$(pwd)":/installer/cluster ibmcom/cfc-installer:1.2.0 install -vvv > /tmp/out
+        cd ~
+        wget https://www.ibm.com/developerworks/community/files/form/anonymous/api/library/08eb2105-21e6-479b-8c5d-76a39e55c16a/document/3c1c3da4-ac5b-4c86-a495-2f6cba166734/media/update-cert.sh
+        chmod +x update-cert.sh 
+        sudo ./update-cert.sh 
+      checkRunning.command: |
+        sudo docker ps | grep kubelet
+      launch.command: |
+        touch /tmp/running
+      provisioning.properties:
+        osFamily: Ubuntu
+        osVersionRegex: 16.*
+        domainName: icp.ibm.com
+        groupId: icp-master
+        minDisk: 100gb
+        templateOptions:
+          blockDevices: 
+            - 100
+  - id: icp-ce-cluster-application
+    itemType: entity
+    item:
+      type: org.apache.brooklyn.entity.stock.BasicApplication
+      brooklyn.parameters:
+        - name: icp.worker.cluster.initial.size
+          type: integer
+          label: "Initial Size of the Worker Cluster"
+          description: |
+            The initial size of the cluster of ICp Worker Nodes
+          default: 2
+      brooklyn.children:
+      - type: icp-ce-worker-cluster-entity
+        name: ICp CE Worker Cluster
+        brooklyn.config:
+          brooklyn_dns.enabled: true
+      - type: icp-ce-master-node
+        name: ICp CE Master Node
+        brooklyn.config:
+          brooklyn_dns.enabled: true
+  # define a template to make it easily accessible in the UI
+  - id: icp-ce-cluster-template
+    name: ICp CE Cluster
+    description: A configurable ICp CE cluster
+    iconUrl: https://www.ibm.com/cloud-computing/images/cloud/products/ibm-cloud-private/kubernets-logo.svg
+    itemType: template
+    item:
+      name: IBM Cloud private CE Cluster
+      brooklyn.parameters:
+        - name: icp.worker.cluster.initial.size
+          type: integer
+          label: "Initial Size of the Worker Cluster"
+          description: |
+            The initial size of the cluster of ICp CE Worker Nodes
+          default: 2
+      services:
+        - type: brooklyn-dns-etc-hosts-generator
+          brooklyn_dns.domain: icp.ibm.com
+          brooklyn_dns.hosts.address.sensor: host.subnet.address
+        - type: icp-ce-cluster-application
+          name: "ICp CE Cluster"
+          brooklyn.config:
+            brooklyn_dns.enabled: true
+            files.preinstall: 
+              file:///home/amp/.ssh/id_rsa: /home/users/amp/root_id_rsa
+              file:///home/amp/.ssh/id_rsa.pub: /home/users/amp/root_id_rsa.pub
+            pre.install.command: |
+              # ICp requires the hostname to match the entry in /etc/hosts
+              sudo hostname ${ENTITY_ID}
+              sudo systemctl stop ufw
+              sudo [ -d /root/.ssh/ ] || sudo mkdir /root/.ssh/
+              sudo touch /root/.ssh/authorized_keys
+              cat ~/root_id_rsa.pub | sudo tee -a /root/.ssh/authorized_keys
+              sudo chmod -R go-rwx /root/.ssh
+              sudo sed -i 's/PermitRootLogin no/#PermitRootLogin no/g' /etc/ssh/sshd_config
+              sudo service ssh restart
+              sudo sed -i 's/127.0.1.1/#127.0.1.1/g' /etc/hosts
+              sudo apt-get update
+              sudo apt-get install -y python
+              sudo apt-get -f install
+              sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+              sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+              sudo apt-get update
+              sudo apt-get install -y docker-ce
+              sudo docker pull ibmcom/cfc-installer:1.2.0
